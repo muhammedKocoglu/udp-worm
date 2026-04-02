@@ -1,5 +1,7 @@
 #include "UDPReceiver.hpp"
 #include "RaptorQFEC.hpp"
+#include "ReedSolomonFEC.hpp"
+#include "LDPCFEC.hpp"
 #include <iostream>
 #include <vector>
 #include <algorithm>
@@ -110,6 +112,16 @@ UDPReceiver::UDPReceiver(uint16_t port,
     if (ec) {
         std::cerr << "Warning: Failed to set send buffer size: " << ec.message() << std::endl;
     }
+
+    if (dynamic_cast<ReedSolomonFEC*>(fec_strategy_.get())) {
+        fec_type_ = "rs";
+    } else if (dynamic_cast<RaptorQFEC*>(fec_strategy_.get())) {
+        fec_type_ = "raptorq";
+    } else if (dynamic_cast<LDPCFEC*>(fec_strategy_.get())) {
+        fec_type_ = "ldpc";
+    } else {
+        fec_type_ = "unknown";
+    }
 }
 
 UDPReceiver::~UDPReceiver() {
@@ -133,6 +145,7 @@ void UDPReceiver::listen(size_t K, const std::atomic<bool>& running, std::chrono
     socket_.non_blocking(true);
     const size_t M = (K == 50) ? 10 : (K == 100) ? 20 : 4;
     const size_t total_expected = K + M;
+    const auto global_timeout = timeout * 10;
 
     while (running) {
         try {
@@ -146,12 +159,28 @@ void UDPReceiver::listen(size_t K, const std::atomic<bool>& running, std::chrono
                 // No data available. Check for timeouts on active sessions.
                 for (auto& pair : sessions_) {
                     FileSession& session = pair.second;
-                    if (session.header_info_set && 
-                        std::chrono::steady_clock::now() - session.last_packet_time > timeout) {
-                        
+                    if (!session.header_info_set || session.is_finalized) {
+                        continue;
+                    }
+                    if (!session.file_stream.is_open()) {
+                        session.is_finalized = true;
+                        continue;
+                    }
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - session.last_packet_time > global_timeout) {
+                        session.force_finalize = true;
+                        session.abandoned_blocks.clear();
+                        force_decode_attempts(session, K, total_expected, session.highest_block_id_seen + 1);
+                        write_blocks_to_file(session);
+                        session.last_timeout_time = now;
+                        continue;
+                    }
+                    if (session.header_info_set &&
+                        now - session.last_packet_time > timeout &&
+                        (session.last_timeout_time == std::chrono::steady_clock::time_point() ||
+                         now - session.last_timeout_time > timeout)) {
                         force_decode_attempts(session, K, total_expected, std::numeric_limits<uint32_t>::max());
-                        // To prevent repeated timeout triggers, update the time
-                        session.last_packet_time = std::chrono::steady_clock::now();
+                        session.last_timeout_time = now;
                     }
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -178,6 +207,7 @@ void UDPReceiver::process_packet(const std::vector<uint8_t>& buffer, size_t byte
     }
     const size_t M = (K == 50) ? 10 : (K == 100) ? 20 : 4;
     const size_t total_expected = K + M;
+    const size_t trigger_limit = (fec_type_ == "rs") ? K : total_expected;
 
     const PacketHeader* full_header = reinterpret_cast<const PacketHeader*>(buffer.data());
     boost::crc_32_type full_crc;
@@ -226,16 +256,21 @@ void UDPReceiver::process_packet(const std::vector<uint8_t>& buffer, size_t byte
         }
     }
 
-    if (used_mini_header) {
-        std::cerr << "[Warning] Block " << block_id << " Symbol " << symbol_id
-                  << ": Using MiniHeader fallback." << std::endl;
-    } else if (used_mini_backup) {
-        std::cerr << "[Warning] Block " << block_id << " Symbol " << symbol_id
-                  << ": Using MiniHeader fallback." << std::endl;
-    }
-
     FileSession& session = sessions_[file_id];
+    if (session.is_finalized) {
+        return;
+    }
+    if (used_mini_header || used_mini_backup) {
+        ++session.header_fallback_count;
+        constexpr size_t kHeaderWarningThreshold = 10;
+        if (session.header_fallback_count == kHeaderWarningThreshold) {
+            std::cerr << "[Warning] Block " << block_id << " Symbol " << symbol_id
+                      << ": MiniHeader fallback hit " << kHeaderWarningThreshold
+                      << " times; suppressing further warnings." << std::endl;
+        }
+    }
     session.last_packet_time = std::chrono::steady_clock::now();
+    session.last_timeout_time = session.last_packet_time;
 
     if (!session.file_stream.is_open() && session.header_info_set) {
         return; // File already finalized
@@ -281,6 +316,8 @@ void UDPReceiver::process_packet(const std::vector<uint8_t>& buffer, size_t byte
         return;
     }
 
+    session.total_symbols_received++;
+
     // Store the received symbol
     auto& block = session.incoming_blocks[block_id];
     if (block.find(symbol_id) == block.end()) {
@@ -294,9 +331,10 @@ void UDPReceiver::process_packet(const std::vector<uint8_t>& buffer, size_t byte
     //std::cerr << "[BLOCK SIZE " << block.size() << std::endl;
     
     // Check if we have enough symbols to decode the block
-    if (block.size() >= total_expected) {
+    if (block.size() >= trigger_limit) {
         const size_t missing_data = count_missing_data_symbols(block, K);
         session.erasure_count += missing_data;
+        session.total_blocks_processed++;
 
         std::vector<std::vector<uint8_t>> decoded_symbols;
         //d::cerr << "[missing_data " << missing_data << std::endl;
@@ -306,7 +344,12 @@ void UDPReceiver::process_packet(const std::vector<uint8_t>& buffer, size_t byte
                 decoded_symbols.push_back(block.at(static_cast<uint16_t>(i)));
             }
         } else {
+            const auto decode_start = std::chrono::high_resolution_clock::now();
             decoded_symbols = fec_strategy_->decode(block, K, block_id);
+            const auto decode_end = std::chrono::high_resolution_clock::now();
+            session.total_decode_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                                           decode_end - decode_start)
+                                           .count();
         }
 
         if (!decoded_symbols.empty()) {
@@ -315,12 +358,13 @@ void UDPReceiver::process_packet(const std::vector<uint8_t>& buffer, size_t byte
                 session.corrected_blocks++;
             }
             session.incoming_blocks.erase(block_id);
+            session.abandoned_blocks.erase(block_id);
         } else {
             session.failed_blocks++;
             auto* raptorq = dynamic_cast<RaptorQFEC*>(fec_strategy_.get());
-            if (raptorq && raptorq->last_decode_status() == "NEED_DATA" && block.size() >= K) {
+            if (raptorq && raptorq->last_decode_status() == "NEED_DATA") {
                 std::cout << "[INFO] Block " << block_id
-                          << ": K symbols reached but matrix unsolvable. Waiting for parity..." << std::endl;
+                          << ": Waiting for additional overhead symbols...." << std::endl;
             }
         }
         write_blocks_to_file(session);
@@ -336,6 +380,11 @@ void UDPReceiver::force_decode_attempts(FileSession& session,
         const auto& block_id = it->first;
         auto& symbol_map = it->second;
 
+        if (session.abandoned_blocks.count(block_id)) {
+            ++it;
+            continue;
+        }
+
         if (block_id >= up_to_block_id) {
             ++it;
             continue;
@@ -347,6 +396,7 @@ void UDPReceiver::force_decode_attempts(FileSession& session,
 
         const size_t missing_data = count_missing_data_symbols(symbol_map, K);
         session.erasure_count += missing_data;
+        session.total_blocks_processed++;
 
         std::vector<std::vector<uint8_t>> decoded_symbols;
         if (missing_data == 0) {
@@ -355,7 +405,12 @@ void UDPReceiver::force_decode_attempts(FileSession& session,
                 decoded_symbols.push_back(symbol_map.at(static_cast<uint16_t>(i)));
             }
         } else {
+            const auto decode_start = std::chrono::high_resolution_clock::now();
             decoded_symbols = fec_strategy_->decode(symbol_map, K, block_id);
+            const auto decode_end = std::chrono::high_resolution_clock::now();
+            session.total_decode_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                                           decode_end - decode_start)
+                                           .count();
         }
 
         if (!decoded_symbols.empty()) {
@@ -365,13 +420,13 @@ void UDPReceiver::force_decode_attempts(FileSession& session,
                 session.corrected_blocks++;
             }
             it = session.incoming_blocks.erase(it);
+            session.abandoned_blocks.erase(block_id);
         } else {
             session.failed_blocks++;
-            auto* raptorq = dynamic_cast<RaptorQFEC*>(fec_strategy_.get());
-            if (raptorq && raptorq->last_decode_status() == "NEED_DATA" && symbol_map.size() >= K) {
-                std::cout << "[INFO] Block " << block_id
-                          << ": K symbols reached but matrix unsolvable. Waiting for parity..." << std::endl;
-            }
+            std::cout << "[ERROR] Block " << block_id
+                      << ": Permanent recovery failure with " << symbol_map.size()
+                      << "/" << total_expected << " symbols.." << std::endl;
+            session.abandoned_blocks.insert(block_id);
             ++it;
         }
     }
@@ -395,38 +450,62 @@ void UDPReceiver::write_blocks_to_file(FileSession& session) {
 
         session.reassembled_blocks.erase(session.next_block_to_write);
         session.next_block_to_write++;
+    }
 
-        if (session.file_stream.is_open() && static_cast<uint64_t>(session.file_stream.tellp()) >= session.total_file_size) {
-            std::cout << "[RECEPTION] File complete: " << session.file_name << std::endl;
-            session.file_stream.close();
-            const std::filesystem::path file_path =
-                session.file_path.empty() ? std::filesystem::path(session.file_name) : session.file_path;
-            try {
-                std::filesystem::resize_file(file_path, session.total_file_size);
+    const std::streampos current_pos = session.file_stream.tellp();
+    const uint64_t bytes_written =
+        (current_pos == std::streampos(-1)) ? 0 : static_cast<uint64_t>(current_pos);
+    const bool reached_expected = bytes_written >= session.total_file_size;
 
-                auto perms = static_cast<std::filesystem::perms>(session.permissions);
-                std::filesystem::permissions(file_path, perms, std::filesystem::perm_options::replace);
+    if ((reached_expected || session.force_finalize) && session.file_stream.is_open()) {
+        session.file_stream.close();
+        const std::filesystem::path file_path =
+            session.file_path.empty() ? std::filesystem::path(session.file_name) : session.file_path;
+        try {
+            const uint64_t final_size = session.force_finalize ? bytes_written : session.total_file_size;
+            std::filesystem::resize_file(file_path, final_size);
 
-                std::chrono::nanoseconds ns(session.last_write_time);
-                std::filesystem::file_time_type ftime(ns);
-                std::filesystem::last_write_time(file_path, ftime);
-                
-            } catch (const std::filesystem::filesystem_error& e) {
-                std::cerr << "Warning: Could not restore file metadata for " 
-                          << session.file_name << ". Reason: " << e.what() << std::endl;
-            }
+            auto perms = static_cast<std::filesystem::perms>(session.permissions);
+            std::filesystem::permissions(file_path, perms, std::filesystem::perm_options::replace);
 
-            if (log_stream_ && log_stream_->is_open()) {
-                const std::string md5 = calculate_md5(file_path.string());
-                (*log_stream_) << "[RECEPTION] File: " << session.file_name
-                               << " | Size:" << session.total_file_size
-                               << " | FEC: Corrected:" << session.corrected_blocks
-                               << ", Failed:" << session.failed_blocks
-                               << ", Erasures:" << session.erasure_count
-                               << " | MD5: " << md5 << "\n";
-                log_stream_->flush();
-            }
+            std::chrono::nanoseconds ns(session.last_write_time);
+            std::filesystem::file_time_type ftime(ns);
+            std::filesystem::last_write_time(file_path, ftime);
+
+        } catch (const std::filesystem::filesystem_error& e) {
+            std::cerr << "Warning: Could not restore file metadata for "
+                      << session.file_name << ". Reason: " << e.what() << std::endl;
         }
+
+        const std::string md5 = calculate_md5(file_path.string());
+        const uint32_t blocks_written = session.next_block_to_write;
+        const size_t blocks_attempted = session.total_blocks_processed;
+        const size_t failed_blocks = session.abandoned_blocks.size();
+        const long long avg_decode_us =
+            blocks_written > 0 ? (session.total_decode_us / static_cast<long long>(blocks_written)) : 0;
+
+        std::ostringstream stats;
+        stats << "[RECEPTION] File complete: " << session.file_name << "\n"
+              << "[STATS] FEC Strategy: " << fec_type_ << "\n"
+              << "[STATS] Total Size: " << session.total_file_size << " bytes\n"
+              << "[STATS] Total Symbols Received: " << session.total_symbols_received << "\n"
+              << "[STATS] Blocks: Total:" << blocks_written
+              << ", Corrected:" << session.corrected_blocks
+              << ", Failed:" << failed_blocks << "\n"
+              << "[STATS] Total Decoding Time: " << session.total_decode_us << " us\n"
+              << "[STATS] Avg Decoder Time/Block: " << avg_decode_us << " us\n"
+              << "[STATS] Decoding Success Rate: " << session.corrected_blocks << "/"
+              << blocks_attempted << "\n"
+              << "[STATS] Erasures: " << session.erasure_count << "\n"
+              << "[STATS] File MD5: " << md5 << "\n";
+
+        std::cout << stats.str();
+        if (log_stream_ && log_stream_->is_open()) {
+            (*log_stream_) << stats.str();
+            log_stream_->flush();
+        }
+        session.is_finalized = true;
+        session.force_finalize = false;
     }
 }
 

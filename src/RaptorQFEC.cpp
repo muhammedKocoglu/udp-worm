@@ -1,12 +1,13 @@
 #include "RaptorQFEC.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <span>
 #include <string>
 #include <vector>
-#include <sstream>
 #ifdef RQ_HEADER_ONLY
 #include <RaptorQ/v1/caches.ipp>
 #endif
@@ -24,40 +25,6 @@ RaptorQ__v1::Block_Size block_size_for_k(size_t symbols) {
         }
     }
     return static_cast<RaptorQ__v1::Block_Size>(0);
-}
-
-std::string format_symbol_id_list(const std::map<uint16_t, std::vector<uint8_t>>& symbols) {
-    std::ostringstream oss;
-    oss << "[";
-    bool first = true;
-    for (const auto& pair : symbols) {
-        if (!first) {
-            oss << ", ";
-        }
-        oss << pair.first;
-        first = false;
-    }
-    oss << "]";
-    return oss.str();
-}
-
-std::string format_repair_symbol_id_list(const std::map<uint16_t, std::vector<uint8_t>>& symbols,
-                                         uint16_t data_symbol_count) {
-    std::ostringstream oss;
-    oss << "[";
-    bool first = true;
-    for (const auto& pair : symbols) {
-        if (pair.first < data_symbol_count) {
-            continue;
-        }
-        if (!first) {
-            oss << ", ";
-        }
-        oss << pair.first;
-        first = false;
-    }
-    oss << "]";
-    return oss.str();
 }
 
 const char* decoder_result_to_string(RaptorQ__v1::Decoder_Result result) {
@@ -96,18 +63,6 @@ const char* error_to_string(RaptorQ__v1::Error err) {
     }
 }
 
-void log_decode_failure(uint32_t block_id,
-                        size_t required_symbols,
-                        const std::map<uint16_t, std::vector<uint8_t>>& received_symbols,
-                        const char* cause) {
-    std::cerr << "[FEC] Block " << block_id << ": Decode failed. Required " << required_symbols
-              << ", but only " << received_symbols.size() << " symbols present: "
-              << format_symbol_id_list(received_symbols);
-    if (cause && *cause) {
-        std::cerr << ". Cause: " << cause;
-    }
-    std::cerr << std::endl;
-}
 } // namespace
 
 RaptorQFEC::RaptorQFEC(size_t data_symbols, size_t parity_symbols)
@@ -116,46 +71,82 @@ RaptorQFEC::RaptorQFEC(size_t data_symbols, size_t parity_symbols)
 
 std::vector<std::vector<uint8_t>> RaptorQFEC::encode(const std::vector<std::vector<uint8_t>>& source_symbols) {
     if (source_symbols.empty()) {
+        std::cerr << "[ERROR] RaptorQ encode failed: no source symbols." << std::endl;
         return {};
     }
 
     const size_t K = source_symbols.size();
     if (data_symbols_ != 0 && K != data_symbols_) {
+        std::cerr << "[ERROR] RaptorQ encode failed: K mismatch (expected "
+                  << data_symbols_ << ", got " << K << ")." << std::endl;
         return {};
     }
     const size_t T = source_symbols[0].size();
+    // Note: libRaptorQ cached mode expects symbol sizes aligned (often 4 or 8 bytes).
     if (T == 0) {
+        std::cerr << "[ERROR] RaptorQ encode failed: symbol size is 0." << std::endl;
         return {};
     }
 
     for (const auto& symbol : source_symbols) {
         if (symbol.size() != T) {
+            std::cerr << "[ERROR] RaptorQ encode failed: symbol size mismatch." << std::endl;
             return {};
         }
     }
 
-    std::vector<uint8_t> source_data;
-    source_data.reserve(K * T);
-    for (const auto& symbol : source_symbols) {
-        source_data.insert(source_data.end(), symbol.begin(), symbol.end());
-    }
-
     const auto block_size = block_size_for_k(K);
     if (block_size == static_cast<RaptorQ__v1::Block_Size>(0)) {
+        std::cerr << "[ERROR] RaptorQ encode failed: unsupported block size." << std::endl;
         return {};
     }
 
-    using Encoder = RaptorQ__v1::Encoder<uint8_t*, uint8_t*>;
-    Encoder encoder(block_size, T);
-    if (!encoder) {
+    last_encode_compute_us_ = -1;
+    if (!cached_encoder_ || last_K_ != K || last_symbol_size_ != T) {
+        cached_encoder_ = std::make_unique<Encoder>(block_size, T);
+        if (!*cached_encoder_) {
+            std::cerr << "[ERROR] RaptorQ encode failed: encoder init failed." << std::endl;
+            cached_encoder_.reset();
+            return {};
+        }
+        if (!cached_encoder_->precompute_sync()) {
+            std::cerr << "[ERROR] RaptorQ encode failed: precompute_sync failed." << std::endl;
+            cached_encoder_.reset();
+            return {};
+        }
+        last_K_ = K;
+        last_symbol_size_ = T;
+    }
+
+    // RaptorQ keeps pointers to the source buffer; store it on the instance to
+    // satisfy source-data lifetime. The matrix is cached (amortized O(1)), but
+    // intermediate symbols must be recomputed (O(K)) for each new block.
+    const size_t total_bytes = K * T;
+    if (persistent_buffer_.capacity() < total_bytes) {
+        persistent_buffer_.reserve(total_bytes);
+    }
+    if (persistent_buffer_.size() != total_bytes) {
+        persistent_buffer_.resize(total_bytes);
+    }
+    size_t offset = 0;
+    for (const auto& symbol : source_symbols) {
+        std::memcpy(persistent_buffer_.data() + offset, symbol.data(), T);
+        offset += T;
+    }
+
+    cached_encoder_->clear_data();
+    uint8_t* data_start = persistent_buffer_.data();
+    uint8_t* data_end = data_start + persistent_buffer_.size();
+    cached_encoder_->set_data(data_start, data_end);
+    const auto compute_start = std::chrono::high_resolution_clock::now();
+    if (!cached_encoder_->compute_sync()) {
+        std::cerr << "[ERROR] RaptorQ encode failed: compute_sync failed." << std::endl;
         return {};
     }
-    uint8_t* data_start = source_data.data();
-    uint8_t* data_end = data_start + source_data.size();
-    encoder.set_data(data_start, data_end);
-    if (!encoder.precompute_sync() || !encoder.compute_sync()) {
-        return {};
-    }
+    const auto compute_end = std::chrono::high_resolution_clock::now();
+    last_encode_compute_us_ = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  compute_end - compute_start)
+                                  .count();
 
     const size_t M = parity_symbols_;
     std::vector<std::vector<uint8_t>> parity_symbols;
@@ -166,8 +157,26 @@ std::vector<std::vector<uint8_t>> RaptorQFEC::encode(const std::vector<std::vect
         std::vector<uint8_t> symbol(T);
         uint8_t* out = symbol.data();
         uint8_t* out_end = out + symbol.size();
-        const size_t written = encoder.encode(out, out_end, esi);
+        size_t written = cached_encoder_->encode(out, out_end, esi);
+        if (written == 0) {
+            if (!cached_encoder_->precompute_sync()) {
+                std::cerr << "[ERROR] RaptorQ encode failed: precompute_sync retry failed." << std::endl;
+                return {};
+            }
+            if (!cached_encoder_->compute_sync()) {
+                std::cerr << "[ERROR] RaptorQ encode failed: compute_sync retry failed." << std::endl;
+                return {};
+            }
+            written = cached_encoder_->encode(out, out_end, esi);
+            if (written == 0) {
+                const auto err = cached_encoder_->compute().get();
+                std::cerr << "[ERROR] RaptorQ encode failed for ESI " << esi
+                          << " (" << error_to_string(err) << ")" << std::endl;
+                return {};
+            }
+        }
         if (written != symbol.size()) {
+            std::cerr << "[ERROR] RaptorQ encode failed for ESI " << esi << std::endl;
             return {};
         }
         parity_symbols.push_back(std::move(symbol));
@@ -185,33 +194,28 @@ std::vector<std::vector<uint8_t>> RaptorQFEC::decode(
 
     if (received_symbols.empty() || K_data_symbols == 0) {
         last_decode_status_ = "INVALID_INPUT";
-        log_decode_failure(block_id, K_data_symbols, received_symbols, "empty symbols or K=0");
         return {};
     }
     if (data_symbols_ != 0 && K_data_symbols != data_symbols_) {
         last_decode_status_ = "K_MISMATCH";
-        log_decode_failure(block_id, data_symbols_, received_symbols, "K mismatch");
         return {};
     }
 
     const size_t T = received_symbols.begin()->second.size();
     if (T == 0) {
         last_decode_status_ = "INVALID_SYMBOL_SIZE";
-        log_decode_failure(block_id, K_data_symbols, received_symbols, "symbol size is 0");
         return {};
     }
 
     for (const auto& pair : received_symbols) {
         if (pair.second.size() != T) {
             last_decode_status_ = "INVALID_SYMBOL_SIZE";
-            log_decode_failure(block_id, K_data_symbols, received_symbols, "symbol size mismatch");
             return {};
         }
     }
 
     if (received_symbols.size() < K_data_symbols) {
         last_decode_status_ = "INSUFFICIENT_SYMBOLS";
-        log_decode_failure(block_id, K_data_symbols, received_symbols, "insufficient symbols");
         return {};
     }
 
@@ -229,12 +233,9 @@ std::vector<std::vector<uint8_t>> RaptorQFEC::decode(
         }
         return direct_data;
     }
-    const bool math_used = !all_data_present;
-
     const auto block_size = block_size_for_k(K_data_symbols);
     if (block_size == static_cast<RaptorQ__v1::Block_Size>(0)) {
         last_decode_status_ = "UNSUPPORTED_BLOCK_SIZE";
-        log_decode_failure(block_id, K_data_symbols, received_symbols, "unsupported block size");
         return {};
     }
 
@@ -242,7 +243,6 @@ std::vector<std::vector<uint8_t>> RaptorQFEC::decode(
     Decoder decoder(block_size, T, RaptorQ__v1::Dec_Report::COMPLETE);
     if (!decoder) {
         last_decode_status_ = "DECODER_INIT_FAILED";
-        log_decode_failure(block_id, K_data_symbols, received_symbols, "decoder initialization failed");
         return {};
     }
 
@@ -252,10 +252,7 @@ std::vector<std::vector<uint8_t>> RaptorQFEC::decode(
         uint8_t* it_end = it_start + pair.second.size();
         const auto err = decoder.add_symbol(it_start, it_end, esi);
         if (err != RaptorQ__v1::Error::NONE && err != RaptorQ__v1::Error::NOT_NEEDED) {
-            std::ostringstream cause;
-            cause << "add_symbol ESI " << esi << " (" << error_to_string(err) << ")";
             last_decode_status_ = error_to_string(err);
-            log_decode_failure(block_id, K_data_symbols, received_symbols, cause.str().c_str());
             return {};
         }
     }
@@ -266,10 +263,7 @@ std::vector<std::vector<uint8_t>> RaptorQFEC::decode(
         report = decoder.decode_once();
     }
     if (report != RaptorQ__v1::Decoder_Result::DECODED) {
-        std::ostringstream cause;
-        cause << "decode result " << decoder_result_to_string(report);
         last_decode_status_ = decoder_result_to_string(report);
-        log_decode_failure(block_id, K_data_symbols, received_symbols, cause.str().c_str());
         return {};
     }
 
@@ -278,17 +272,8 @@ std::vector<std::vector<uint8_t>> RaptorQFEC::decode(
     uint8_t* out_end = out_it + output.size();
     const auto decoded = decoder.decode_bytes(out_it, out_end, 0, 0);
     if (decoded.written != output.size()) {
-        std::ostringstream cause;
-        cause << "decode_bytes wrote " << decoded.written << "/" << output.size();
         last_decode_status_ = "DECODE_INCOMPLETE";
-        log_decode_failure(block_id, K_data_symbols, received_symbols, cause.str().c_str());
         return {};
-    }
-
-    if (math_used) {
-        std::cout << "[FEC] Block " << block_id << ": Fixed using repair symbols "
-                  << format_repair_symbol_id_list(received_symbols, static_cast<uint16_t>(K_data_symbols))
-                  << "." << std::endl;
     }
 
     std::vector<std::vector<uint8_t>> decoded_symbols;

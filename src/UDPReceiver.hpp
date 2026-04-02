@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <chrono>
 #include <atomic>
+#include <set>
 
 namespace udpworm {
 
@@ -39,6 +40,7 @@ private:
         std::string file_name;
         std::ofstream file_stream;
         std::chrono::steady_clock::time_point last_packet_time;
+        std::chrono::steady_clock::time_point last_timeout_time;
         uint32_t highest_block_id_seen = 0;
 
         // block_id -> {symbol_id -> symbol_data}
@@ -52,6 +54,13 @@ private:
         size_t corrected_blocks = 0;
         size_t failed_blocks = 0;
         size_t erasure_count = 0;
+        long long total_decode_us = 0;
+        size_t total_blocks_processed = 0;
+        size_t total_symbols_received = 0;
+        size_t header_fallback_count = 0;
+        std::set<uint32_t> abandoned_blocks;
+        bool force_finalize = false;
+        bool is_finalized = false;
         std::filesystem::path file_path;
     };
 
@@ -65,6 +74,7 @@ private:
     std::unique_ptr<std::ofstream> log_stream_;
     asio::io_context io_context_;
     udp::socket socket_;
+    std::string fec_type_;
 
     // file_id -> session
     std::map<uint32_t, FileSession> sessions_;

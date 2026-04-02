@@ -1,6 +1,7 @@
 #include "FECTestRunner.hpp"
 #include "ReedSolomonFEC.hpp"
 #include "RaptorQFEC.hpp"
+#include "LDPCFEC.hpp"
 #include <openssl/evp.h>
 #include <algorithm>
 #include <chrono>
@@ -186,6 +187,9 @@ TestTimings run_single_test(IFECStrategy& strategy,
     const auto encode_end = std::chrono::high_resolution_clock::now();
     timings.encode_us =
         std::chrono::duration_cast<std::chrono::microseconds>(encode_end - encode_start).count();
+    if (raptorq && raptorq->last_encode_compute_us() >= 0) {
+        timings.encode_us = raptorq->last_encode_compute_us();
+    }
     std::cout << "[UNIT TEST] Encode time: " << timings.encode_us << " us" << std::endl;
 
     if (M > 0 && parity_symbols.size() != M) {
@@ -348,6 +352,8 @@ bool FECTestRunner::run_test(const std::string& fec_name,
                 strategy = std::make_unique<ReedSolomonFEC>(summary.K, summary.M);
             } else if (fec_name == "raptorq") {
                 strategy = std::make_unique<RaptorQFEC>(summary.K, summary.M);
+            } else if (fec_name == "ldpc") {
+                strategy = std::make_unique<LDPCFEC>(summary.K, summary.M);
             } else {
                 std::cerr << "[UNIT TEST] Unknown FEC type: " << fec_name << std::endl;
                 return false;

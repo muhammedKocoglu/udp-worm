@@ -3,6 +3,7 @@
 #include "ReedSolomonFEC.hpp"
 #include "RaptorQFEC.hpp"
 #include "FECTestRunner.hpp"
+#include "LDPCFEC.hpp"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -24,14 +25,16 @@ void signal_handler(int signum) {
 
 void print_usage() {
     std::cerr << "Usage:\n"
-              << "  udp_fec_test sender <filepath> <host> <port> <K> <MTU> <delay_us> <loss_rate> <header_flip_rate> <payload_flip_rate> [--fec <rs|raptorq>]\n"
-              << "  udp_fec_test receiver <port> <K> <timeout_ms> <output_path> [log_path] [--fec <rs|raptorq>]\n"
-              << "  udp_fec_test unit_test <rs|raptorq> all [symbol_size]\n"
+              << "  udp_fec_test sender <filepath> <host> <port> <K> <MTU> <delay_us> <loss_rate> <header_flip_rate> <payload_flip_rate> [--fec <rs|raptorq|ldpc>]\n"
+              << "  udp_fec_test receiver <port> <K> <timeout_ms> <output_path> [log_path] [--fec <rs|raptorq|ldpc>]\n"
+              << "  udp_fec_test unit_test <rs|raptorq|ldpc> all [symbol_size]\n"
               << "\n"
               << "Example Sender:   ./udp_fec_test sender ./test.txt 127.0.0.1 8080 10 1400 100 0.05 0.01 0.02 --fec rs\n"
               << "Example Receiver: ./udp_fec_test receiver 8080 10 500 ./out ./recv.log --fec raptorq\n"
+              << "Example Receiver: ./udp_fec_test receiver 8080 10 500 ./out ./recv.log --fec ldpc\n"
               << "Example Unit Test: ./udp_fec_test unit_test rs all\n"
               << "Example Unit Test: ./udp_fec_test unit_test raptorq all\n"
+              << "Example Unit Test: ./udp_fec_test unit_test ldpc all\n"
               << "Tip: Use delay_us >= 50 for local loopback to reduce packet drops.\n";
 }
 
@@ -54,6 +57,9 @@ int main(int argc, char* argv[]) {
             }
             if (fec_name == "raptorq") {
                 return std::make_unique<udpworm::RaptorQFEC>(K, M);
+            }
+            if (fec_name == "ldpc") {
+                return std::make_unique<udpworm::LDPCFEC>(K, M);
             }
             throw std::runtime_error("Unknown FEC type: " + fec_name);
         };
@@ -96,7 +102,8 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<udpworm::IFECStrategy> fec_strategy = make_fec_strategy(fec_name, K);
             udpworm::UDPSender sender(std::move(fec_strategy), host, port,
                                       std::chrono::microseconds(delay_us), loss_rate,
-                                      header_flip_rate, payload_flip_rate);
+                                      header_flip_rate, payload_flip_rate,
+                                      fec_name);
             std::cout << "SENDER: Using FEC " << fec_name << std::endl;
             std::cout << "SENDER: Sending " << file_path << " to " << host << ":" << port 
                       << " with " << (loss_rate * 100) << "% simulated loss." << std::endl;
@@ -149,7 +156,8 @@ int main(int argc, char* argv[]) {
             std::vector<std::pair<size_t, size_t>> configs;
             size_t symbol_size = 0;
 
-            if ((fec_name == "rs" || fec_name == "raptorq") && std::string(argv[3]) == "all") {
+            if ((fec_name == "rs" || fec_name == "raptorq" || fec_name == "ldpc") &&
+                std::string(argv[3]) == "all") {
                 constexpr size_t kDefaultSymbolSize = 128;
                 configs = {{10, 4}, {50, 10}, {100, 20}};
                 if (argc == 4) {

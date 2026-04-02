@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 
 namespace udpworm {
@@ -23,11 +24,18 @@ public:
         size_t K_data_symbols,
         uint32_t block_id) override;
     const std::string& last_decode_status() const { return last_decode_status_; }
+    long long last_encode_compute_us() const { return last_encode_compute_us_; }
 
 private:
+    using Encoder = RaptorQ__v1::Encoder<uint8_t*, uint8_t*>;
     size_t data_symbols_;
     size_t parity_symbols_;
+    size_t last_K_ = 0;
+    size_t last_symbol_size_ = 0;
+    std::unique_ptr<Encoder> cached_encoder_;
+    std::vector<uint8_t> persistent_buffer_;
     std::string last_decode_status_;
+    long long last_encode_compute_us_ = -1;
 };
 
 } // namespace udpworm

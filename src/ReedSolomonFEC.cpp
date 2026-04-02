@@ -18,39 +18,6 @@ namespace {
     // Field size for GF(2^8) is 2^8 - 1 = 255.
     constexpr std::size_t kNaturalLength = (1u << kFieldDescriptor) - 1;
 
-    std::string format_symbol_id_list(const std::map<uint16_t, std::vector<uint8_t>>& symbols) {
-        std::ostringstream oss;
-        oss << "[";
-        bool first = true;
-        for (const auto& pair : symbols) {
-            if (!first) {
-                oss << ", ";
-            }
-            oss << pair.first;
-            first = false;
-        }
-        oss << "]";
-        return oss.str();
-    }
-
-    std::string format_repair_symbol_id_list(const std::map<uint16_t, std::vector<uint8_t>>& symbols,
-                                             uint16_t data_symbol_count) {
-        std::ostringstream oss;
-        oss << "[";
-        bool first = true;
-        for (const auto& pair : symbols) {
-            if (pair.first < data_symbol_count) {
-                continue;
-            }
-            if (!first) {
-                oss << ", ";
-            }
-            oss << pair.first;
-            first = false;
-        }
-        oss << "]";
-        return oss.str();
-    }
 }
 
 struct ReedSolomonFEC::SchifraImplBase {
@@ -144,16 +111,10 @@ struct ReedSolomonFEC::SchifraImpl final : ReedSolomonFEC::SchifraImplBase {
         uint32_t block_id) override {
 
         if (K_data_symbols != kDataSymbols) {
-            std::cerr << "[FEC] Block " << block_id << ": Decode failed. Required " << kDataSymbols
-                      << ", but only " << received_symbols.size() << " symbols present: "
-                      << format_symbol_id_list(received_symbols) << ". Cause: K mismatch." << std::endl;
             return {};
         }
 
         if (received_symbols.size() < kDataSymbols) {
-            std::cerr << "[FEC] Block " << block_id << ": Decode failed. Required " << kDataSymbols
-                      << ", but only " << received_symbols.size() << " symbols present: "
-                      << format_symbol_id_list(received_symbols) << "." << std::endl;
             return {};
         }
 
@@ -194,16 +155,10 @@ struct ReedSolomonFEC::SchifraImpl final : ReedSolomonFEC::SchifraImplBase {
             // If there are erasures, decode with erasure information
             if (!erasure_locations.empty()) {
                 if (!decoder->decode(block, erasure_locations)) {
-                    std::cerr << "[FEC] Block " << block_id << ": Decode failed. Required " << kDataSymbols
-                              << ", but only " << received_symbols.size() << " symbols present: "
-                              << format_symbol_id_list(received_symbols) << ". Cause: decoder failure." << std::endl;
                     return {};
                 }
             } else { // No erasures, just check for errors
                 if (!decoder->decode(block)) {
-                    std::cerr << "[FEC] Block " << block_id << ": Decode failed. Required " << kDataSymbols
-                              << ", but only " << received_symbols.size() << " symbols present: "
-                              << format_symbol_id_list(received_symbols) << ". Cause: decoder failure." << std::endl;
                     return {};
                 }
             }
@@ -214,9 +169,6 @@ struct ReedSolomonFEC::SchifraImpl final : ReedSolomonFEC::SchifraImplBase {
             }
         }
 
-        std::cout << "[FEC] Block " << block_id << ": Fixed using repair symbols "
-                  << format_repair_symbol_id_list(received_symbols, static_cast<uint16_t>(kDataSymbols))
-                  << "." << std::endl;
         return reconstructed_data;
     }
 
@@ -242,7 +194,15 @@ ReedSolomonFEC::ReedSolomonFEC(size_t data_symbols, size_t parity_symbols) {
 ReedSolomonFEC::~ReedSolomonFEC() = default;
 
 std::vector<std::vector<uint8_t>> ReedSolomonFEC::encode(const std::vector<std::vector<uint8_t>>& source_symbols) {
-    return impl_->encode(source_symbols);
+    if (source_symbols.empty()) {
+        std::cerr << "[ERROR] Reed-Solomon encode failed: no source symbols." << std::endl;
+        return {};
+    }
+    auto parity = impl_->encode(source_symbols);
+    if (parity.empty()) {
+        std::cerr << "[ERROR] Reed-Solomon encode failed for K=" << source_symbols.size() << std::endl;
+    }
+    return parity;
 }
 
 std::vector<std::vector<uint8_t>> ReedSolomonFEC::decode(

@@ -18,7 +18,8 @@ UDPSender::UDPSender(std::unique_ptr<IFECStrategy> fec_strategy,
                      std::chrono::microseconds packet_delay,
                      float loss_rate,
                      float header_bit_flip_rate,
-                     float payload_bit_flip_rate)
+                     float payload_bit_flip_rate,
+                     std::string fec_name)
     : fec_strategy_(std::move(fec_strategy)),
       packet_delay_(packet_delay),
       loss_rate_(loss_rate),
@@ -26,7 +27,8 @@ UDPSender::UDPSender(std::unique_ptr<IFECStrategy> fec_strategy,
       payload_bit_flip_rate_(payload_bit_flip_rate),
       io_context_(),
       socket_(io_context_, udp::endpoint(udp::v4(), 0)),
-      distribution_(0.0f, 1.0f) {
+      distribution_(0.0f, 1.0f),
+      fec_name_(std::move(fec_name)) {
     
     boost::system::error_code ec;
     socket_.set_option(asio::socket_base::send_buffer_size(8 * 1024 * 1024), ec);
@@ -73,6 +75,16 @@ void UDPSender::send_file(const std::filesystem::path& file_path, size_t K, size
 
     uint32_t block_id = 0;
 
+    total_encode_us_ = 0;
+    total_send_us_ = 0;
+    packets_dropped_ = 0;
+    header_flips_ = 0;
+    payload_flips_ = 0;
+    total_blocks_ = 0;
+
+    uint64_t total_payload_bytes = 0;
+    const auto transfer_start = std::chrono::high_resolution_clock::now();
+
     while (true) {
         std::vector<std::vector<uint8_t>> data_symbols = packetizer.get_next_block(K, symbol_payload_size);
         if (data_symbols.empty()) {
@@ -82,7 +94,12 @@ void UDPSender::send_file(const std::filesystem::path& file_path, size_t K, size
         header.block_id = block_id;
 
         // --- Encode to get parity symbols ---
+        const auto encode_start = std::chrono::high_resolution_clock::now();
         std::vector<std::vector<uint8_t>> parity_symbols = fec_strategy_->encode(data_symbols);
+        const auto encode_end = std::chrono::high_resolution_clock::now();
+        total_encode_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                                encode_end - encode_start)
+                                .count();
 
         // --- Send Data Symbols ---
         uint16_t symbol_id = 0;
@@ -96,6 +113,10 @@ void UDPSender::send_file(const std::filesystem::path& file_path, size_t K, size
                     std::this_thread::yield();
                 }
             }
+            const auto send_end = std::chrono::high_resolution_clock::now();
+            total_send_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                                  send_end - send_start)
+                                  .count();
         }
 
         // --- Send Parity Symbols ---
@@ -109,16 +130,49 @@ void UDPSender::send_file(const std::filesystem::path& file_path, size_t K, size
                     std::this_thread::yield();
                 }
             }
+            const auto send_end = std::chrono::high_resolution_clock::now();
+            total_send_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                                  send_end - send_start)
+                                  .count();
         }
 
         std::cout << "Sent block " << block_id << " ( " << symbol_id << " total symbols)" << std::endl;
+        total_payload_bytes += static_cast<uint64_t>(data_symbols.size() + parity_symbols.size()) *
+                               static_cast<uint64_t>(symbol_payload_size);
+        total_blocks_++;
         block_id++;
     }
+
+    const auto transfer_end = std::chrono::high_resolution_clock::now();
+    const auto total_tx_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                 transfer_end - transfer_start)
+                                 .count();
+    const double total_tx_s = total_tx_us > 0 ? static_cast<double>(total_tx_us) / 1'000'000.0 : 0.0;
+    const double total_mb = static_cast<double>(total_payload_bytes) / (1024.0 * 1024.0);
+    const double throughput = total_tx_s > 0.0 ? (total_mb / total_tx_s) : 0.0;
+    const long long avg_encode_us =
+        total_blocks_ > 0 ? (total_encode_us_ / static_cast<long long>(total_blocks_)) : 0;
+
+    std::ostringstream stats;
+    stats << "[SENDER STATS]\n"
+          << "FEC Strategy: " << fec_name_ << "\n"
+          << "Total Blocks: " << total_blocks_ << "\n"
+          << "Total Encoding Time: " << total_encode_us_ << " us (avg "
+          << avg_encode_us << " us/block)\n"
+          << "Total Transmission Time: " << total_tx_us << " us\n"
+          << "Effective Throughput: " << std::fixed << std::setprecision(2)
+          << throughput << " MB/s\n"
+          << "Simulated Chaos: Drops=" << packets_dropped_
+          << ", HeaderFlips=" << header_flips_
+          << ", PayloadFlips=" << payload_flips_ << "\n";
+
+    std::cout << stats.str();
 }
 
 void UDPSender::send_packet(const PacketHeader& header, std::span<const uint8_t> payload) {
     // Simulate packet loss
     if (loss_rate_ > 0 && distribution_(random_generator_) < loss_rate_) {
+        packets_dropped_++;
         std::cout << "[Simulated Loss] Dropping Block: " << header.block_id 
                   << ", Symbol: " << header.symbol_id << std::endl;
         return; // Drop the packet
@@ -140,6 +194,7 @@ void UDPSender::send_packet(const PacketHeader& header, std::span<const uint8_t>
     MiniHeader mini_header_backup = mini_header;
 
     if (header_bit_flip_rate_ > 0.0f && distribution_(random_generator_) < header_bit_flip_rate_) {
+        header_flips_++;
         inject_bit_flip(reinterpret_cast<uint8_t*>(&header_with_crc), sizeof(header_with_crc));
         std::cout << "[Chaos] Injected bit-flip into Header for Block " << header.block_id
                   << ", Symbol " << header.symbol_id << std::endl;
@@ -153,6 +208,7 @@ void UDPSender::send_packet(const PacketHeader& header, std::span<const uint8_t>
     size_t payload_size = payload.size();
     std::vector<uint8_t> payload_copy;
     if (payload_bit_flip_rate_ > 0.0f && distribution_(random_generator_) < payload_bit_flip_rate_) {
+        payload_flips_++;
         payload_copy.assign(payload.begin(), payload.end());
         inject_bit_flip(payload_copy.data(), payload_copy.size());
         payload_data = payload_copy.data();

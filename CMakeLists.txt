@@ -14,12 +14,17 @@ find_package(Threads REQUIRED)
 # Gather all source files
 file(GLOB_RECURSE SOURCES "src/*.cpp")
 
+set(OPENFEC_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/openfec_v1.4.2)
+file(GLOB_RECURSE OPENFEC_SOURCES "${OPENFEC_ROOT}/src/*.c")
+
 # Add the executable
-add_executable(udp_fec_test ${SOURCES})
+add_executable(udp_fec_test ${SOURCES} ${OPENFEC_SOURCES})
 
 set(RAPTORQ_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libraptorq)
 set(RAPTORQ_INCLUDE_DIR ${RAPTORQ_ROOT})
 set(RAPTORQ_EIGEN_DIR ${RAPTORQ_ROOT}/eigen3)
+set(OPENFEC_INCLUDE_DIR ${OPENFEC_ROOT}/src)
+set(OPENFEC_COMMON_INCLUDE_DIR ${OPENFEC_ROOT}/src/lib_common)
 
 # Include directories
 target_include_directories(udp_fec_test PRIVATE
@@ -27,6 +32,8 @@ target_include_directories(udp_fec_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     ${RAPTORQ_INCLUDE_DIR}
     ${RAPTORQ_EIGEN_DIR}
+    ${OPENFEC_INCLUDE_DIR}
+    ${OPENFEC_COMMON_INCLUDE_DIR}
     ${Boost_INCLUDE_DIRS}
 )
 target_compile_definitions(udp_fec_test PRIVATE RQ_HEADER_ONLY)
