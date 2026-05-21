@@ -17,7 +17,7 @@ public:
     // Returns an empty vector of vectors when all data has been processed.
     std::vector<std::vector<uint8_t>> get_next_block(size_t K, size_t symbol_size);
 
-    uint32_t get_file_id() const;
+    uint16_t get_file_id() const;
     uint64_t get_total_file_size() const;
     const std::string& get_file_name() const;
     uint32_t get_permissions() const;
@@ -29,7 +29,7 @@ private:
     std::string name_;
     std::ifstream stream_;
     uint64_t total_size_;
-    uint32_t id_;
+    uint16_t id_;
     uint32_t permissions_;
     int64_t last_write_time_;
 

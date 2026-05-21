@@ -41,13 +41,13 @@ The executable is `build/udp_fec_test`.
 Sender:
 
 ```bash
-./udp_fec_test sender <filepath> <host> <port> <K> <MTU> <delay_us> <loss_rate> <header_flip_rate> <payload_flip_rate> [--fec <rs|raptorq>]
+./udp_fec_test sender <filepath> <host> <port> <K> <M> <MTU> <delay_us> <block_delay_us> <loss_rate> <header_flip_rate> <payload_flip_rate> [--fec <rs|raptorq|ldpc>]
 ```
 
 Receiver:
 
 ```bash
-./udp_fec_test receiver <port> <K> <timeout_ms> <output_path> [log_path] [--fec <rs|raptorq>]
+./udp_fec_test receiver <port> <K> <M> <timeout_ms> <output_path> [log_path] [--fec <rs|raptorq|ldpc>]
 ```
 
 Unit tests (no UDP):
@@ -59,8 +59,8 @@ Unit tests (no UDP):
 Examples:
 
 ```bash
-./udp_fec_test sender ./test.txt 127.0.0.1 8080 10 1400 100 0.05 0.01 0.02 --fec rs
-./udp_fec_test receiver 8080 10 500 ./out ./recv.log --fec raptorq
+./udp_fec_test sender ./test.txt 127.0.0.1 8080 10 4 1400 100 1000 0.05 0.01 0.02 --fec rs
+./udp_fec_test receiver 8080 10 4 500 ./out ./recv.log --fec raptorq
 ./udp_fec_test unit_test rs all 128
 ./udp_fec_test unit_test raptorq all 128
 ```
@@ -69,17 +69,22 @@ Notes:
 
 - `delay_us` is the pacing delay between packets. For local loopback, use
   at least 50-100 microseconds.
+- `block_delay_us` is the pause after each full FEC block (data + parity) is sent.
 - Loss and bit-flip rates are floats in [0.0, 1.0].
 - Default FEC is Reed-Solomon unless `--fec raptorq` is provided.
 
 ## FEC Parameters
 
 K is the number of data symbols per block. M is the number of parity symbols.
-For both strategies, M is derived from K:
+For sender/receiver modes, both `K` and `M` are provided explicitly via CLI.
 
-- K = 50 -> M = 10
-- K = 100 -> M = 20
-- Otherwise (K=10) -> M = 4
+Supported `(K, M)` configurations used by tests and strategy construction:
+
+- `(10, 4)`
+- `(50, 20)`
+- `(100, 15)`
+- `(100, 25)`
+- `(100, 40)`
 
 ## Protocol Notes
 
@@ -99,4 +104,3 @@ If payload CRC fails, the symbol is dropped as an erasure.
 - `src/` core sender, receiver, and FEC strategies
 - `third_party/schifra` Reed-Solomon library
 - `third_party/libraptorq` RaptorQ library
-

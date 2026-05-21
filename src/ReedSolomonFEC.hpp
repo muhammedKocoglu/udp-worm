@@ -18,12 +18,14 @@ public:
     std::vector<std::vector<uint8_t>> decode(
         const std::map<uint16_t, std::vector<uint8_t>>& received_symbols, 
         size_t K_data_symbols,
-        uint32_t block_id) override;
+        uint16_t block_id) override;
 
 private:
     struct SchifraImplBase;
     template <size_t DataSymbols, size_t ParitySymbols>
     struct SchifraImpl;
+    template <size_t ParitySymbols>
+    struct SchifraDynamicImpl;
     std::unique_ptr<SchifraImplBase> impl_;
 };
 

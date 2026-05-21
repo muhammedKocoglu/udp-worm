@@ -16,12 +16,14 @@ UDPSender::UDPSender(std::unique_ptr<IFECStrategy> fec_strategy,
                      const std::string& host, 
                      uint16_t port,
                      std::chrono::microseconds packet_delay,
+                     std::chrono::microseconds block_delay,
                      float loss_rate,
                      float header_bit_flip_rate,
                      float payload_bit_flip_rate,
                      std::string fec_name)
     : fec_strategy_(std::move(fec_strategy)),
       packet_delay_(packet_delay),
+      block_delay_(block_delay),
       loss_rate_(loss_rate),
       header_bit_flip_rate_(header_bit_flip_rate),
       payload_bit_flip_rate_(payload_bit_flip_rate),
@@ -63,6 +65,8 @@ void UDPSender::send_file(const std::filesystem::path& file_path, size_t K, size
         throw std::runtime_error("MTU is too small for packet headers and payload CRC.");
     }
 
+    std::cout << "header size:" << header_bytes << "symbol size:" << symbol_payload_size << "\n";
+
     PacketHeader header;
     header.file_id = packetizer.get_file_id();
     header.total_file_size = packetizer.get_total_file_size();
@@ -73,7 +77,7 @@ void UDPSender::send_file(const std::filesystem::path& file_path, size_t K, size
     std::strncpy(header.file_name, packetizer.get_file_name().c_str(), MAX_FILENAME_SIZE - 1);
     header.file_name[MAX_FILENAME_SIZE - 1] = '\0';
 
-    uint32_t block_id = 0;
+    uint16_t block_id = 0;
 
     total_encode_us_ = 0;
     total_send_us_ = 0;
@@ -92,6 +96,7 @@ void UDPSender::send_file(const std::filesystem::path& file_path, size_t K, size
         }
 
         header.block_id = block_id;
+        const size_t drops_before_block = packets_dropped_;
 
         // --- Encode to get parity symbols ---
         const auto encode_start = std::chrono::high_resolution_clock::now();
@@ -136,11 +141,18 @@ void UDPSender::send_file(const std::filesystem::path& file_path, size_t K, size
                                   .count();
         }
 
-        std::cout << "Sent block " << block_id << " ( " << symbol_id << " total symbols)" << std::endl;
+        const size_t dropped_in_block = packets_dropped_ - drops_before_block;
+        //std::cout << "Sent block " << block_id << " ( " << symbol_id
+        //<< " total symbols, dropped: " << dropped_in_block << ")"
+        //<< std::endl;
         total_payload_bytes += static_cast<uint64_t>(data_symbols.size() + parity_symbols.size()) *
                                static_cast<uint64_t>(symbol_payload_size);
         total_blocks_++;
         block_id++;
+
+        if (block_delay_.count() > 0) {
+            std::this_thread::sleep_for(block_delay_);
+        }
     }
 
     const auto transfer_end = std::chrono::high_resolution_clock::now();
@@ -159,7 +171,8 @@ void UDPSender::send_file(const std::filesystem::path& file_path, size_t K, size
           << "Total Blocks: " << total_blocks_ << "\n"
           << "Total Encoding Time: " << total_encode_us_ << " us (avg "
           << avg_encode_us << " us/block)\n"
-          << "Total Transmission Time: " << total_tx_us << " us\n"
+          << "Total Packet Send Time: " << total_send_us_ << " us\n"
+          << "Total Sender Process Time: " << total_tx_us << " us\n"
           << "Effective Throughput: " << std::fixed << std::setprecision(2)
           << throughput << " MB/s\n"
           << "Simulated Chaos: Drops=" << packets_dropped_

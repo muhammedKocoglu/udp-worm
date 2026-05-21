@@ -22,7 +22,7 @@ public:
     std::vector<std::vector<uint8_t>> decode(
         const std::map<uint16_t, std::vector<uint8_t>>& received_symbols, 
         size_t K_data_symbols,
-        uint32_t block_id) override;
+        uint16_t block_id) override;
     const std::string& last_decode_status() const { return last_decode_status_; }
     long long last_encode_compute_us() const { return last_encode_compute_us_; }
 

@@ -21,6 +21,7 @@ public:
               const std::string& host, 
               uint16_t port,
               std::chrono::microseconds packet_delay,
+              std::chrono::microseconds block_delay,
               float loss_rate,
               float header_bit_flip_rate,
               float payload_bit_flip_rate,
@@ -32,6 +33,7 @@ public:
 private:
     std::unique_ptr<IFECStrategy> fec_strategy_;
     std::chrono::microseconds packet_delay_;
+    std::chrono::microseconds block_delay_;
     float loss_rate_;
     float header_bit_flip_rate_;
     float payload_bit_flip_rate_;

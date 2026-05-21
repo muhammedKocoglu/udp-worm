@@ -141,9 +141,11 @@ UDPReceiver::~UDPReceiver() {
     }
 }
 
-void UDPReceiver::listen(size_t K, const std::atomic<bool>& running, std::chrono::milliseconds timeout) {
+void UDPReceiver::listen(size_t K,
+                         size_t M,
+                         const std::atomic<bool>& running,
+                         std::chrono::milliseconds timeout) {
     socket_.non_blocking(true);
-    const size_t M = (K == 50) ? 10 : (K == 100) ? 20 : 4;
     const size_t total_expected = K + M;
     const auto global_timeout = timeout * 10;
 
@@ -190,7 +192,7 @@ void UDPReceiver::listen(size_t K, const std::atomic<bool>& running, std::chrono
                 throw boost::system::system_error(error);
             }
 
-            process_packet(recv_buffer, bytes_transferred, K);
+            process_packet(recv_buffer, bytes_transferred, K, M);
 
         } catch (const boost::system::system_error& e) {
             if (running) {
@@ -200,12 +202,14 @@ void UDPReceiver::listen(size_t K, const std::atomic<bool>& running, std::chrono
     }
 }
 
-void UDPReceiver::process_packet(const std::vector<uint8_t>& buffer, size_t bytes_transferred, size_t K) {
+void UDPReceiver::process_packet(const std::vector<uint8_t>& buffer,
+                                 size_t bytes_transferred,
+                                 size_t K,
+                                 size_t M) {
     const size_t header_bytes = sizeof(PacketHeader) + (2 * sizeof(MiniHeader));
     if (bytes_transferred < (header_bytes + sizeof(uint32_t))) {
         return; 
     }
-    const size_t M = (K == 50) ? 10 : (K == 100) ? 20 : 4;
     const size_t total_expected = K + M;
     const size_t trigger_limit = (fec_type_ == "rs") ? K : total_expected;
 
@@ -214,8 +218,8 @@ void UDPReceiver::process_packet(const std::vector<uint8_t>& buffer, size_t byte
     full_crc.process_bytes(full_header, offsetof(PacketHeader, header_crc));
     const bool full_header_valid = (full_crc.checksum() == full_header->header_crc);
 
-    uint32_t file_id = 0;
-    uint32_t block_id = 0;
+    uint16_t file_id = 0;
+    uint16_t block_id = 0;
     uint16_t symbol_id = 0;
 
     bool used_mini_header = false;
@@ -225,6 +229,7 @@ void UDPReceiver::process_packet(const std::vector<uint8_t>& buffer, size_t byte
         file_id = full_header->file_id;
         block_id = full_header->block_id;
         symbol_id = full_header->symbol_id;
+        //std::cout << "file_id block_id symbol_id:" << file_id << block_id << symbol_id;
     } else {
         const auto* mini_header = reinterpret_cast<const MiniHeader*>(buffer.data() + sizeof(PacketHeader));
         const auto* mini_header_backup =
@@ -259,6 +264,10 @@ void UDPReceiver::process_packet(const std::vector<uint8_t>& buffer, size_t byte
     FileSession& session = sessions_[file_id];
     if (session.is_finalized) {
         return;
+    }
+    if (!session.has_start_time) {
+        session.start_time = std::chrono::steady_clock::now();
+        session.has_start_time = true;
     }
     if (used_mini_header || used_mini_backup) {
         ++session.header_fallback_count;
@@ -483,6 +492,11 @@ void UDPReceiver::write_blocks_to_file(FileSession& session) {
         const size_t failed_blocks = session.abandoned_blocks.size();
         const long long avg_decode_us =
             blocks_written > 0 ? (session.total_decode_us / static_cast<long long>(blocks_written)) : 0;
+        const auto completion_time = std::chrono::steady_clock::now();
+        const long long total_reception_us =
+            session.has_start_time
+                ? std::chrono::duration_cast<std::chrono::microseconds>(completion_time - session.start_time).count()
+                : 0;
 
         std::ostringstream stats;
         stats << "[RECEPTION] File complete: " << session.file_name << "\n"
@@ -494,6 +508,7 @@ void UDPReceiver::write_blocks_to_file(FileSession& session) {
               << ", Failed:" << failed_blocks << "\n"
               << "[STATS] Total Decoding Time: " << session.total_decode_us << " us\n"
               << "[STATS] Avg Decoder Time/Block: " << avg_decode_us << " us\n"
+              << "[STATS] Total Reception Time: " << total_reception_us << " us\n"
               << "[STATS] Decoding Success Rate: " << session.corrected_blocks << "/"
               << blocks_attempted << "\n"
               << "[STATS] Erasures: " << session.erasure_count << "\n"

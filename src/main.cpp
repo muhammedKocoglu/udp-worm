@@ -22,20 +22,23 @@ void signal_handler(int signum) {
     }
 }
 
+namespace {
+} // namespace
+
 
 void print_usage() {
     std::cerr << "Usage:\n"
-              << "  udp_fec_test sender <filepath> <host> <port> <K> <MTU> <delay_us> <loss_rate> <header_flip_rate> <payload_flip_rate> [--fec <rs|raptorq|ldpc>]\n"
-              << "  udp_fec_test receiver <port> <K> <timeout_ms> <output_path> [log_path] [--fec <rs|raptorq|ldpc>]\n"
+              << "  udp_fec_test sender <filepath> <host> <port> <K> <M> <MTU> <delay_us> <block_delay_us> <loss_rate> <header_flip_rate> <payload_flip_rate> [--fec <rs|raptorq|ldpc>]\n"
+              << "  udp_fec_test receiver <port> <K> <M> <timeout_ms> <output_path> [log_path] [--fec <rs|raptorq|ldpc>]\n"
               << "  udp_fec_test unit_test <rs|raptorq|ldpc> all [symbol_size]\n"
               << "\n"
-              << "Example Sender:   ./udp_fec_test sender ./test.txt 127.0.0.1 8080 10 1400 100 0.05 0.01 0.02 --fec rs\n"
-              << "Example Receiver: ./udp_fec_test receiver 8080 10 500 ./out ./recv.log --fec raptorq\n"
-              << "Example Receiver: ./udp_fec_test receiver 8080 10 500 ./out ./recv.log --fec ldpc\n"
+              << "Example Sender:   ./udp_fec_test sender ./test.txt 127.0.0.1 8080 10 4 1400 100 1000 0.05 0.01 0.02 --fec rs\n"
+              << "Example Receiver: ./udp_fec_test receiver 8080 10 4 500 ./out ./recv.log --fec raptorq\n"
+              << "Example Receiver: ./udp_fec_test receiver 8080 10 4 500 ./out ./recv.log --fec ldpc\n"
               << "Example Unit Test: ./udp_fec_test unit_test rs all\n"
               << "Example Unit Test: ./udp_fec_test unit_test raptorq all\n"
               << "Example Unit Test: ./udp_fec_test unit_test ldpc all\n"
-              << "Tip: Use delay_us >= 50 for local loopback to reduce packet drops.\n";
+              << "Tip: Use delay_us >= 50 for local loopback and block_delay_us for inter-block pacing.\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -49,9 +52,8 @@ int main(int argc, char* argv[]) {
     // The FEC strategy is instantiated inside the modes where it's used.
 
     try {
-        auto make_fec_strategy = [](const std::string& fec_name, size_t K)
+        auto make_fec_strategy = [](const std::string& fec_name, size_t K, size_t M)
             -> std::unique_ptr<udpworm::IFECStrategy> {
-            const size_t M = (K == 50) ? 10 : (K == 100) ? 20 : 4;
             if (fec_name == "rs") {
                 return std::make_unique<udpworm::ReedSolomonFEC>(K, M);
             }
@@ -65,7 +67,7 @@ int main(int argc, char* argv[]) {
         };
 
         if (mode == "sender") {
-            if (argc < 11) {
+            if (argc < 13) {
                 print_usage();
                 return 1;
             }
@@ -74,8 +76,10 @@ int main(int argc, char* argv[]) {
             std::string host = argv[argi++];
             uint16_t port = static_cast<uint16_t>(std::stoul(argv[argi++]));
             size_t K = std::stoul(argv[argi++]);
+            size_t M = std::stoul(argv[argi++]);
             size_t mtu = std::stoul(argv[argi++]);
             long long delay_us = std::stoll(argv[argi++]);
+            long long block_delay_us = std::stoll(argv[argi++]);
             float loss_rate = std::stof(argv[argi++]);
             float header_flip_rate = std::stof(argv[argi++]);
             float payload_flip_rate = std::stof(argv[argi++]);
@@ -99,9 +103,11 @@ int main(int argc, char* argv[]) {
                 throw std::runtime_error("File not found: " + file_path.string());
             }
             
-            std::unique_ptr<udpworm::IFECStrategy> fec_strategy = make_fec_strategy(fec_name, K);
+            std::unique_ptr<udpworm::IFECStrategy> fec_strategy = make_fec_strategy(fec_name, K, M);
             udpworm::UDPSender sender(std::move(fec_strategy), host, port,
-                                      std::chrono::microseconds(delay_us), loss_rate,
+                                      std::chrono::microseconds(delay_us),
+                                      std::chrono::microseconds(block_delay_us),
+                                      loss_rate,
                                       header_flip_rate, payload_flip_rate,
                                       fec_name);
             std::cout << "SENDER: Using FEC " << fec_name << std::endl;
@@ -110,13 +116,14 @@ int main(int argc, char* argv[]) {
             sender.send_file(file_path, K, mtu);
 
         } else if (mode == "receiver") {
-            if (argc < 6) {
+            if (argc < 7) {
                 print_usage();
                 return 1;
             }
             int argi = 2;
             uint16_t port = static_cast<uint16_t>(std::stoul(argv[argi++]));
             size_t K = std::stoul(argv[argi++]);
+            size_t M = std::stoul(argv[argi++]);
             long long timeout_ms = std::stoll(argv[argi++]);
             std::filesystem::path output_path = argv[argi++];
             std::filesystem::path log_path;
@@ -141,11 +148,11 @@ int main(int argc, char* argv[]) {
             signal(SIGINT, signal_handler);
             signal(SIGTERM, signal_handler);
 
-            std::unique_ptr<udpworm::IFECStrategy> fec_strategy = make_fec_strategy(fec_name, K);
+            std::unique_ptr<udpworm::IFECStrategy> fec_strategy = make_fec_strategy(fec_name, K, M);
             udpworm::UDPReceiver receiver(port, std::move(fec_strategy), output_path, log_path);
             std::cout << "RECEIVER: Using FEC " << fec_name << std::endl;
             std::cout << "RECEIVER: Listening on port " << port << ". Press Ctrl+C to stop." << std::endl;
-            receiver.listen(K, running, std::chrono::milliseconds(timeout_ms));
+            receiver.listen(K, M, running, std::chrono::milliseconds(timeout_ms));
             std::cout << "\nRECEIVER: Shutting down." << std::endl;
         } else if (mode == "unit_test") {
             if (argc < 4) {
@@ -159,7 +166,7 @@ int main(int argc, char* argv[]) {
             if ((fec_name == "rs" || fec_name == "raptorq" || fec_name == "ldpc") &&
                 std::string(argv[3]) == "all") {
                 constexpr size_t kDefaultSymbolSize = 128;
-                configs = {{10, 4}, {50, 10}, {100, 20}};
+                configs = {{10, 4}, {50, 20}, {100, 15}, {100, 25}, {100, 40}};
                 if (argc == 4) {
                     symbol_size = kDefaultSymbolSize;
                 } else if (argc == 5) {

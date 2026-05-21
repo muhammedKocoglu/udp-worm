@@ -27,7 +27,7 @@ struct ReedSolomonFEC::SchifraImplBase {
     virtual std::vector<std::vector<uint8_t>> decode(
         const std::map<uint16_t, std::vector<uint8_t>>& received_symbols,
         size_t K_data_symbols,
-        uint32_t block_id) = 0;
+        uint16_t block_id) = 0;
     virtual size_t data_symbols() const = 0;
     virtual size_t parity_symbols() const = 0;
 };
@@ -108,7 +108,7 @@ struct ReedSolomonFEC::SchifraImpl final : ReedSolomonFEC::SchifraImplBase {
     std::vector<std::vector<uint8_t>> decode(
         const std::map<uint16_t, std::vector<uint8_t>>& received_symbols,
         size_t K_data_symbols,
-        uint32_t block_id) override {
+        uint16_t block_id) override {
 
         if (K_data_symbols != kDataSymbols) {
             return {};
@@ -176,17 +176,201 @@ struct ReedSolomonFEC::SchifraImpl final : ReedSolomonFEC::SchifraImplBase {
     size_t parity_symbols() const override { return kParitySymbols; }
 };
 
+template <size_t ParitySymbols>
+struct ReedSolomonFEC::SchifraDynamicImpl final : ReedSolomonFEC::SchifraImplBase {
+    static constexpr std::size_t kParitySymbols = ParitySymbols;
+    static constexpr std::size_t kCodeLength = kNaturalLength;
+    static constexpr std::size_t kDataSymbolsMax = kCodeLength - kParitySymbols;
+
+    schifra::galois::field field;
+    schifra::galois::field_polynomial generator_polynomial;
+    using Encoder = schifra::reed_solomon::encoder<kCodeLength, kParitySymbols>;
+    using Decoder = schifra::reed_solomon::decoder<kCodeLength, kParitySymbols>;
+    std::unique_ptr<Encoder> encoder;
+    std::unique_ptr<Decoder> decoder;
+
+    SchifraDynamicImpl()
+        : field(kFieldDescriptor,
+                schifra::galois::primitive_polynomial_size06,
+                schifra::galois::primitive_polynomial06),
+          generator_polynomial(field) {
+        if (!schifra::make_sequential_root_generator_polynomial(
+                field, kGenPolyIndex, kParitySymbols, generator_polynomial)) {
+            throw std::runtime_error("Failed to create generator polynomial");
+        }
+        encoder = std::make_unique<Encoder>(field, generator_polynomial);
+        decoder = std::make_unique<Decoder>(field, kGenPolyIndex);
+    }
+
+    std::vector<std::vector<uint8_t>> encode(
+        const std::vector<std::vector<uint8_t>>& source_symbols) override {
+        if (source_symbols.empty()) {
+            return {};
+        }
+        const std::size_t runtime_k = source_symbols.size();
+        if (runtime_k > kDataSymbolsMax) {
+            std::cerr << "[FEC] Reed-Solomon encode failed: K=" << runtime_k
+                      << " exceeds max " << kDataSymbolsMax << " for M=" << kParitySymbols
+                      << " (K+M must be <= 255)." << std::endl;
+            return {};
+        }
+
+        const std::size_t packet_size = source_symbols[0].size();
+        for (const auto& symbol : source_symbols) {
+            if (symbol.size() != packet_size) {
+                return {};
+            }
+        }
+
+        std::vector<std::vector<uint8_t>> repair_symbols(
+            kParitySymbols, std::vector<uint8_t>(packet_size, 0));
+
+        for (size_t i = 0; i < packet_size; ++i) {
+            schifra::reed_solomon::block<kCodeLength, kParitySymbols> block;
+            block.clear();
+
+            for (size_t j = 0; j < kDataSymbolsMax; ++j) {
+                if (j < runtime_k) {
+                    block.data[j] = source_symbols[j][i];
+                } else {
+                    block.data[j] = 0;
+                }
+            }
+
+            if (!encoder->encode(block)) {
+                std::cerr << "[FEC] Reed-Solomon encode failed for column " << i << std::endl;
+                return {};
+            }
+
+            for (size_t p = 0; p < kParitySymbols; ++p) {
+                repair_symbols[p][i] = block.fec(p);
+            }
+        }
+
+        return repair_symbols;
+    }
+
+    std::vector<std::vector<uint8_t>> decode(
+        const std::map<uint16_t, std::vector<uint8_t>>& received_symbols,
+        size_t K_data_symbols,
+        uint16_t /*block_id*/) override {
+        if (K_data_symbols == 0 || K_data_symbols > kDataSymbolsMax) {
+            return {};
+        }
+        if (received_symbols.size() < K_data_symbols) {
+            return {};
+        }
+        if (received_symbols.begin()->second.empty()) {
+            return {};
+        }
+
+        const std::size_t packet_size = received_symbols.begin()->second.size();
+        for (const auto& pair : received_symbols) {
+            if (pair.second.size() != packet_size) {
+                return {};
+            }
+        }
+
+        bool all_data_present = true;
+        for (size_t i = 0; i < K_data_symbols; ++i) {
+            if (received_symbols.find(static_cast<uint16_t>(i)) == received_symbols.end()) {
+                all_data_present = false;
+                break;
+            }
+        }
+        if (all_data_present) {
+            std::vector<std::vector<uint8_t>> direct_data(K_data_symbols);
+            for (size_t i = 0; i < K_data_symbols; ++i) {
+                direct_data[i] = received_symbols.at(static_cast<uint16_t>(i));
+            }
+            return direct_data;
+        }
+
+        std::vector<std::vector<uint8_t>> reconstructed_data(
+            K_data_symbols, std::vector<uint8_t>(packet_size, 0));
+
+        for (size_t i = 0; i < packet_size; ++i) {
+            schifra::reed_solomon::block<kCodeLength, kParitySymbols> block;
+            block.clear();
+            schifra::reed_solomon::erasure_locations_t erasure_locations;
+
+            for (size_t j = 0; j < kDataSymbolsMax; ++j) {
+                if (j < K_data_symbols) {
+                    const uint16_t wire_id = static_cast<uint16_t>(j);
+                    auto it = received_symbols.find(wire_id);
+                    if (it != received_symbols.end()) {
+                        block.data[j] = it->second[i];
+                    } else {
+                        erasure_locations.push_back(j);
+                    }
+                } else {
+                    block.data[j] = 0;
+                }
+            }
+
+            for (size_t p = 0; p < kParitySymbols; ++p) {
+                const uint16_t wire_id = static_cast<uint16_t>(K_data_symbols + p);
+                const size_t code_index = kDataSymbolsMax + p;
+                auto it = received_symbols.find(wire_id);
+                if (it != received_symbols.end()) {
+                    block.data[code_index] = it->second[i];
+                } else {
+                    erasure_locations.push_back(code_index);
+                }
+            }
+
+            const bool ok = erasure_locations.empty()
+                                ? decoder->decode(block)
+                                : decoder->decode(block, erasure_locations);
+            if (!ok) {
+                return {};
+            }
+
+            for (size_t j = 0; j < K_data_symbols; ++j) {
+                reconstructed_data[j][i] = block.data[j];
+            }
+        }
+
+        return reconstructed_data;
+    }
+
+    size_t data_symbols() const override { return kDataSymbolsMax; }
+    size_t parity_symbols() const override { return kParitySymbols; }
+};
+
 ReedSolomonFEC::ReedSolomonFEC(size_t data_symbols, size_t parity_symbols) {
-    if (data_symbols == 10 && parity_symbols == 4) {
-        impl_ = std::make_unique<SchifraImpl<10, 4>>();
-    } else if (data_symbols == 50 && parity_symbols == 10) {
-        impl_ = std::make_unique<SchifraImpl<50, 10>>();
-    } else if (data_symbols == 100 && parity_symbols == 20) {
-        impl_ = std::make_unique<SchifraImpl<100, 20>>();
-    } else {
+    if (data_symbols == 0 || parity_symbols == 0) {
+        throw std::invalid_argument("Reed-Solomon requires K>0 and M>0.");
+    }
+    if (data_symbols + parity_symbols > kNaturalLength) {
         std::ostringstream oss;
-        oss << "Unsupported Reed-Solomon configuration K=" << data_symbols
-            << " M=" << parity_symbols;
+        oss << "Invalid Reed-Solomon configuration K=" << data_symbols
+            << " M=" << parity_symbols << " (K+M must be <= " << kNaturalLength << ")";
+        throw std::invalid_argument(oss.str());
+    }
+    if (parity_symbols > 128) {
+        std::ostringstream oss;
+        oss << "Unsupported Reed-Solomon parity M=" << parity_symbols
+            << " (supported range is 1..128).";
+        throw std::invalid_argument(oss.str());
+    }
+
+    auto make_impl_for_m = [&]<size_t M>(auto&& self, size_t target)
+        -> std::unique_ptr<SchifraImplBase> {
+        if constexpr (M > 128) {
+            return nullptr;
+        } else {
+            if (target == M) {
+                return std::make_unique<SchifraDynamicImpl<M>>();
+            }
+            return self.template operator()<M + 1>(self, target);
+        }
+    };
+
+    impl_ = make_impl_for_m.template operator()<1>(make_impl_for_m, parity_symbols);
+    if (!impl_) {
+        std::ostringstream oss;
+        oss << "Unsupported Reed-Solomon parity M=" << parity_symbols;
         throw std::invalid_argument(oss.str());
     }
 }
@@ -208,7 +392,7 @@ std::vector<std::vector<uint8_t>> ReedSolomonFEC::encode(const std::vector<std::
 std::vector<std::vector<uint8_t>> ReedSolomonFEC::decode(
         const std::map<uint16_t, std::vector<uint8_t>>& received_symbols,
         size_t K_data_symbols,
-        uint32_t block_id) {
+        uint16_t block_id) {
     return impl_->decode(received_symbols, K_data_symbols, block_id);
 }
 

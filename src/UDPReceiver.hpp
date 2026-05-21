@@ -28,8 +28,9 @@ public:
     ~UDPReceiver();
 
     // K: number of data symbols per block.
+    // M: number of parity symbols per block.
     // timeout: duration to wait for a packet before forcing a decode attempt.
-    void listen(size_t K, const std::atomic<bool>& running, std::chrono::milliseconds timeout);
+    void listen(size_t K, size_t M, const std::atomic<bool>& running, std::chrono::milliseconds timeout);
 
 private:
     // A single file transfer session
@@ -41,6 +42,7 @@ private:
         std::ofstream file_stream;
         std::chrono::steady_clock::time_point last_packet_time;
         std::chrono::steady_clock::time_point last_timeout_time;
+        std::chrono::steady_clock::time_point start_time;
         uint32_t highest_block_id_seen = 0;
 
         // block_id -> {symbol_id -> symbol_data}
@@ -61,10 +63,11 @@ private:
         std::set<uint32_t> abandoned_blocks;
         bool force_finalize = false;
         bool is_finalized = false;
+        bool has_start_time = false;
         std::filesystem::path file_path;
     };
 
-    void process_packet(const std::vector<uint8_t>& buffer, size_t bytes_transferred, size_t K);
+    void process_packet(const std::vector<uint8_t>& buffer, size_t bytes_transferred, size_t K, size_t M);
     void write_blocks_to_file(FileSession& session);
     void force_decode_attempts(FileSession& session, size_t K, size_t total_expected, uint32_t up_to_block_id);
 

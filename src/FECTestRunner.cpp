@@ -204,7 +204,7 @@ TestTimings run_single_test(IFECStrategy& strategy,
 
     auto run_scenario = [&](const std::string& label,
                             size_t drop_count,
-                            uint32_t block_id,
+                            uint16_t block_id,
                             bool expect_success,
                             bool prefer_data_first,
                             long long& out_us,
@@ -259,7 +259,7 @@ TestTimings run_single_test(IFECStrategy& strategy,
 
         size_t restored = 0;
         while (true) {
-            const uint32_t block_id = 200 + static_cast<uint32_t>(restored);
+            const uint16_t block_id = 200 + static_cast<uint32_t>(restored);
             const auto decode_start = std::chrono::high_resolution_clock::now();
             auto decoded = strategy.decode(symbols, K, block_id);
             const auto decode_end = std::chrono::high_resolution_clock::now();

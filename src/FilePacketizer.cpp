@@ -64,7 +64,7 @@ std::vector<std::vector<uint8_t>> FilePacketizer::get_next_block(size_t K, size_
     return block;
 }
 
-uint32_t FilePacketizer::get_file_id() const {
+uint16_t FilePacketizer::get_file_id() const {
     return id_;
 }
 

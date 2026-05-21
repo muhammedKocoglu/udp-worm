@@ -188,7 +188,7 @@ std::vector<std::vector<uint8_t>> RaptorQFEC::encode(const std::vector<std::vect
 std::vector<std::vector<uint8_t>> RaptorQFEC::decode(
     const std::map<uint16_t, std::vector<uint8_t>>& received_symbols,
     size_t K_data_symbols,
-    uint32_t block_id) {
+    uint16_t block_id) {
 
     last_decode_status_.clear();
 
